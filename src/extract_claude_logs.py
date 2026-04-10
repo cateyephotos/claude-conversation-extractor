@@ -14,6 +14,48 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
+# Top-level entry types that are JSONL telemetry, not conversation content.
+# These are skipped during extraction regardless of --detailed.
+_NOISE_TOP_LEVEL_TYPES = {
+    "queue-operation",
+    "last-prompt",
+    "attachment",
+}
+
+# Max serialized size (chars) for tool_use input and tool_result content in
+# detailed mode. Read/Write/Edit tool calls can dump entire files; this keeps
+# exports bounded.
+_TOOL_PAYLOAD_MAX_CHARS = 2000
+
+
+def _truncate_payload(payload: str, limit: int = _TOOL_PAYLOAD_MAX_CHARS) -> str:
+    """Truncate a large tool payload with a clear marker."""
+    if len(payload) <= limit:
+        return payload
+    return payload[:limit] + f"\n... [truncated {len(payload) - limit} chars]"
+
+
+def _decode_project_name(encoded: str) -> str:
+    """Decode Claude Code's CWD-as-folder encoding.
+
+    Claude Code stores conversations under ~/.claude/projects/<encoded-cwd>/
+    where slashes and colons are replaced with hyphens. E.g.:
+        C--Users-thomasc8-Downloads -> C:/Users/thomasc8/Downloads
+        Z--git -> Z:/git
+    Returns the original path as a display string; falls back to the raw
+    encoded name if decoding produces something implausible.
+    """
+    if not encoded:
+        return encoded
+    # Windows drive: single letter followed by "--"
+    if len(encoded) >= 3 and encoded[0].isalpha() and encoded[1:3] == "--":
+        return encoded[0] + ":/" + encoded[3:].replace("-", "/")
+    # POSIX absolute path: leading "-" then segments
+    if encoded.startswith("-"):
+        return "/" + encoded.lstrip("-").replace("-", "/")
+    return encoded.replace("-", "/")
+
+
 class ClaudeConversationExtractor:
     """Extract and convert Claude Code conversations from JSONL to markdown."""
 
@@ -67,126 +109,285 @@ class ClaudeConversationExtractor:
 
     def extract_conversation(self, jsonl_path: Path, detailed: bool = False) -> List[Dict[str, str]]:
         """Extract conversation messages from a JSONL file.
-        
+
+        Backward-compatible wrapper around :meth:`extract_session` that
+        returns only the messages list.
+
         Args:
             jsonl_path: Path to the JSONL file
-            detailed: If True, include tool use, MCP responses, and system messages
+            detailed: If True, include thinking blocks, tool_use blocks, and
+                tool_result blocks alongside the normal user/assistant text.
         """
-        conversation = []
+        messages, _metadata = self.extract_session(jsonl_path, detailed=detailed)
+        return messages
+
+    def extract_session_metadata(self, jsonl_path: Path) -> Dict[str, str]:
+        """Read only the session envelope metadata from a JSONL file.
+
+        Faster than :meth:`extract_session` when the caller already has
+        the message list from another source (e.g. a mocked
+        :meth:`extract_conversation`). Walks the file until all known
+        metadata fields are populated, then stops. Returns an empty
+        metadata dict if the file cannot be read.
+        """
+        metadata: Dict[str, str] = {
+            "session_id": jsonl_path.stem if hasattr(jsonl_path, "stem") else "",
+            "cwd": "",
+            "git_branch": "",
+            "version": "",
+            "entrypoint": "",
+            "user_type": "",
+            "first_timestamp": "",
+            "last_timestamp": "",
+            "is_sidechain": False,
+        }
+        field_map = (
+            ("cwd", "cwd"),
+            ("gitBranch", "git_branch"),
+            ("version", "version"),
+            ("entrypoint", "entrypoint"),
+            ("userType", "user_type"),
+        )
+        try:
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line.strip())
+                    except Exception:
+                        continue
+                    for src, dst in field_map:
+                        if not metadata[dst] and entry.get(src):
+                            metadata[dst] = entry[src]
+                    if entry.get("isSidechain"):
+                        metadata["is_sidechain"] = True
+                    ts = entry.get("timestamp", "")
+                    if ts:
+                        if not metadata["first_timestamp"]:
+                            metadata["first_timestamp"] = ts
+                        metadata["last_timestamp"] = ts
+                    # Stop early once all envelope fields are filled.
+                    if all(metadata[dst] for _, dst in field_map):
+                        break
+        except Exception:
+            pass
+        return metadata
+
+    def extract_session(
+        self, jsonl_path: Path, detailed: bool = False
+    ) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
+        """Parse a Claude Code JSONL session file.
+
+        Walks the session once and returns a flat list of conversation
+        messages plus a metadata dict extracted from session envelope fields.
+
+        The current Claude Code JSONL format (verified against v2.1.x) stores
+        tool_use blocks inside ``assistant.message.content[]`` and tool_result
+        blocks inside ``user.message.content[]``. Extended thinking content
+        appears as ``type: "thinking"`` blocks inside assistant content
+        arrays. This walker handles all three plus plain text.
+
+        Args:
+            jsonl_path: Path to the JSONL file.
+            detailed: If True, thinking/tool_use/tool_result blocks are
+                emitted as their own messages. If False, only user/assistant
+                text blocks are returned.
+
+        Returns:
+            Tuple of (messages, metadata). ``messages`` is a list of dicts
+            with at minimum ``role``, ``content``, and ``timestamp``; tool
+            messages also carry ``tool_use_id`` and ``tool_name``/``is_error``.
+        """
+        messages: List[Dict[str, str]] = []
+        metadata: Dict[str, str] = {
+            "session_id": jsonl_path.stem,
+            "cwd": "",
+            "git_branch": "",
+            "version": "",
+            "entrypoint": "",
+            "user_type": "",
+            "first_timestamp": "",
+            "last_timestamp": "",
+            "is_sidechain": False,
+        }
 
         try:
             with open(jsonl_path, "r", encoding="utf-8") as f:
                 for line in f:
                     try:
                         entry = json.loads(line.strip())
-
-                        # Extract user messages
-                        if entry.get("type") == "user" and "message" in entry:
-                            msg = entry["message"]
-                            if isinstance(msg, dict) and msg.get("role") == "user":
-                                content = msg.get("content", "")
-                                text = self._extract_text_content(content)
-
-                                if text and text.strip():
-                                    conversation.append(
-                                        {
-                                            "role": "user",
-                                            "content": text,
-                                            "timestamp": entry.get("timestamp", ""),
-                                        }
-                                    )
-
-                        # Extract assistant messages
-                        elif entry.get("type") == "assistant" and "message" in entry:
-                            msg = entry["message"]
-                            if isinstance(msg, dict) and msg.get("role") == "assistant":
-                                content = msg.get("content", [])
-                                text = self._extract_text_content(content, detailed=detailed)
-
-                                if text and text.strip():
-                                    conversation.append(
-                                        {
-                                            "role": "assistant",
-                                            "content": text,
-                                            "timestamp": entry.get("timestamp", ""),
-                                        }
-                                    )
-                        
-                        # Include tool use and system messages if detailed mode
-                        elif detailed:
-                            # Extract tool use events
-                            if entry.get("type") == "tool_use":
-                                tool_data = entry.get("tool", {})
-                                tool_name = tool_data.get("name", "unknown")
-                                tool_input = tool_data.get("input", {})
-                                conversation.append(
-                                    {
-                                        "role": "tool_use",
-                                        "content": f"🔧 Tool: {tool_name}\nInput: {json.dumps(tool_input, indent=2)}",
-                                        "timestamp": entry.get("timestamp", ""),
-                                    }
-                                )
-                            
-                            # Extract tool results
-                            elif entry.get("type") == "tool_result":
-                                result = entry.get("result", {})
-                                output = result.get("output", "") or result.get("error", "")
-                                conversation.append(
-                                    {
-                                        "role": "tool_result",
-                                        "content": f"📤 Result:\n{output}",
-                                        "timestamp": entry.get("timestamp", ""),
-                                    }
-                                )
-                            
-                            # Extract system messages
-                            elif entry.get("type") == "system" and "message" in entry:
-                                msg = entry.get("message", "")
-                                if msg:
-                                    conversation.append(
-                                        {
-                                            "role": "system",
-                                            "content": f"ℹ️ System: {msg}",
-                                            "timestamp": entry.get("timestamp", ""),
-                                        }
-                                    )
-
                     except json.JSONDecodeError:
                         continue
                     except Exception:
-                        # Silently skip problematic entries
                         continue
+
+                    # Skip pure telemetry entries.
+                    entry_type = entry.get("type", "")
+                    if entry_type in _NOISE_TOP_LEVEL_TYPES:
+                        continue
+
+                    # Capture envelope metadata from any entry that carries it.
+                    # These fields appear on every user/assistant entry in
+                    # modern JSONL; take the first non-empty value we see.
+                    for field_src, field_dst in (
+                        ("cwd", "cwd"),
+                        ("gitBranch", "git_branch"),
+                        ("version", "version"),
+                        ("entrypoint", "entrypoint"),
+                        ("userType", "user_type"),
+                    ):
+                        if not metadata[field_dst] and entry.get(field_src):
+                            metadata[field_dst] = entry[field_src]
+                    if entry.get("isSidechain"):
+                        metadata["is_sidechain"] = True
+                    ts = entry.get("timestamp", "")
+                    if ts:
+                        if not metadata["first_timestamp"]:
+                            metadata["first_timestamp"] = ts
+                        metadata["last_timestamp"] = ts
+
+                    # System entries in current schema have shape
+                    # {"type":"system","subtype":...,"level":...,"content":...}.
+                    # They are mostly hook telemetry; expose only in detailed
+                    # mode so default exports stay clean.
+                    if entry_type == "system":
+                        if not detailed:
+                            continue
+                        sys_content = entry.get("content") or entry.get("message") or ""
+                        if not sys_content:
+                            continue
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": str(sys_content),
+                                "timestamp": ts,
+                                "subtype": entry.get("subtype", ""),
+                                "level": entry.get("level", ""),
+                            }
+                        )
+                        continue
+
+                    if entry_type not in ("user", "assistant"):
+                        continue
+
+                    msg = entry.get("message")
+                    if not isinstance(msg, dict):
+                        continue
+                    role = msg.get("role") or entry_type
+                    content = msg.get("content", "")
+
+                    # Expand content blocks into structured messages.
+                    for block in self._iter_content_blocks(content, role, detailed=detailed):
+                        block.setdefault("timestamp", ts)
+                        messages.append(block)
 
         except Exception as e:
             print(f"❌ Error reading file {jsonl_path}: {e}")
 
-        return conversation
+        return messages, metadata
 
-    def _extract_text_content(self, content, detailed: bool = False) -> str:
-        """Extract text from various content formats Claude uses.
-        
-        Args:
-            content: The content to extract from
-            detailed: If True, include tool use blocks and other metadata
+    def _iter_content_blocks(
+        self, content, default_role: str, detailed: bool = False
+    ):
+        """Yield one or more message dicts from a content payload.
+
+        Claude Code content can be:
+
+        * A plain string (legacy / simple prompts) → one message.
+        * A list of block dicts with ``type`` in {text, thinking, tool_use,
+          tool_result}. Each block becomes its own message.
+
+        In non-detailed mode only ``text`` blocks are emitted, preserving
+        the clean-export contract of earlier versions.
         """
         if isinstance(content, str):
-            return content
-        elif isinstance(content, list):
-            # Extract text from content array
-            text_parts = []
-            for item in content:
-                if isinstance(item, dict):
-                    if item.get("type") == "text":
-                        text_parts.append(item.get("text", ""))
-                    elif detailed and item.get("type") == "tool_use":
-                        # Include tool use details in detailed mode
-                        tool_name = item.get("name", "unknown")
-                        tool_input = item.get("input", {})
-                        text_parts.append(f"\n🔧 Using tool: {tool_name}")
-                        text_parts.append(f"Input: {json.dumps(tool_input, indent=2)}\n")
-            return "\n".join(text_parts)
-        else:
-            return str(content)
+            if content.strip():
+                yield {"role": default_role, "content": content}
+            return
+
+        if not isinstance(content, list):
+            text = str(content)
+            if text.strip():
+                yield {"role": default_role, "content": text}
+            return
+
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            block_type = item.get("type", "")
+
+            if block_type == "text":
+                text = item.get("text", "")
+                if text.strip():
+                    yield {"role": default_role, "content": text}
+                continue
+
+            if not detailed:
+                continue
+
+            if block_type == "thinking":
+                thinking = item.get("thinking") or item.get("text") or ""
+                if thinking.strip():
+                    yield {"role": "thinking", "content": thinking}
+                continue
+
+            if block_type == "tool_use":
+                tool_name = item.get("name", "unknown")
+                tool_input = item.get("input", {})
+                try:
+                    payload = json.dumps(tool_input, indent=2, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    payload = str(tool_input)
+                yield {
+                    "role": "tool_use",
+                    "content": f"Tool: {tool_name}\nInput: {_truncate_payload(payload)}",
+                    "tool_name": tool_name,
+                    "tool_use_id": item.get("id", ""),
+                }
+                continue
+
+            if block_type == "tool_result":
+                # tool_result blocks live inside user messages in the
+                # current schema. The result payload itself may be a
+                # string or another list of text blocks.
+                raw = item.get("content", "")
+                if isinstance(raw, list):
+                    parts = []
+                    for sub in raw:
+                        if isinstance(sub, dict) and sub.get("type") == "text":
+                            parts.append(sub.get("text", ""))
+                        elif isinstance(sub, str):
+                            parts.append(sub)
+                    result_text = "\n".join(p for p in parts if p)
+                elif isinstance(raw, str):
+                    result_text = raw
+                else:
+                    result_text = str(raw)
+                yield {
+                    "role": "tool_result",
+                    "content": _truncate_payload(result_text),
+                    "tool_use_id": item.get("tool_use_id", ""),
+                    "is_error": bool(item.get("is_error", False)),
+                }
+                continue
+
+            # Unknown block type — preserve raw in detailed mode so nothing
+            # is silently dropped as the schema evolves.
+            yield {
+                "role": "unknown",
+                "content": f"[{block_type}] " + json.dumps(item, ensure_ascii=False)[:500],
+            }
+
+    def _extract_text_content(self, content, detailed: bool = False) -> str:
+        """Legacy text extractor retained for any external callers.
+
+        New code should prefer :meth:`extract_session`. This method now
+        delegates to :meth:`_iter_content_blocks` so callers still see
+        thinking/tool blocks when ``detailed=True``.
+        """
+        parts = []
+        for block in self._iter_content_blocks(content, "user", detailed=detailed):
+            parts.append(block["content"])
+        return "\n".join(parts)
 
     def display_conversation(self, jsonl_path: Path, detailed: bool = False) -> None:
         """Display a conversation in the terminal with pagination.
@@ -241,12 +442,19 @@ class ClaudeConversationExtractor:
                     print(f"\n{'─' * 40}")
                     print(f"🤖 CLAUDE:")
                     print(f"{'─' * 40}")
+                elif role == "thinking":
+                    print(f"\n💭 THINKING:")
                 elif role == "tool_use":
-                    print(f"\n🔧 TOOL USE:")
+                    tool_name = msg.get("tool_name", "")
+                    label = f"🔧 TOOL USE: {tool_name}" if tool_name else "🔧 TOOL USE:"
+                    print(f"\n{label}")
                 elif role == "tool_result":
-                    print(f"\n📤 TOOL RESULT:")
+                    marker = "❌ TOOL ERROR:" if msg.get("is_error") else "📤 TOOL RESULT:"
+                    print(f"\n{marker}")
                 elif role == "system":
-                    print(f"\nℹ️ SYSTEM:")
+                    subtype = msg.get("subtype", "")
+                    label = f"ℹ️ SYSTEM ({subtype}):" if subtype else "ℹ️ SYSTEM:"
+                    print(f"\n{label}")
                 else:
                     print(f"\n{role.upper()}:")
                 
@@ -285,9 +493,20 @@ class ClaudeConversationExtractor:
             input("\nPress Enter to continue...")
 
     def save_as_markdown(
-        self, conversation: List[Dict[str, str]], session_id: str
+        self,
+        conversation: List[Dict[str, str]],
+        session_id: str,
+        metadata: Optional[Dict[str, str]] = None,
     ) -> Optional[Path]:
-        """Save conversation as clean markdown file."""
+        """Save conversation as clean markdown file.
+
+        Args:
+            conversation: Flat message list from :meth:`extract_session`.
+            session_id: Session identifier (used for the output filename).
+            metadata: Optional session envelope metadata (cwd, git_branch,
+                version, entrypoint). When supplied it is rendered as a
+                YAML frontmatter block at the top of the file.
+        """
         if not conversation:
             return None
 
@@ -306,35 +525,104 @@ class ClaudeConversationExtractor:
             date_str = datetime.now().strftime("%Y-%m-%d")
             time_str = ""
 
-        filename = f"claude-conversation-{date_str}-{session_id[:8]}.md"
+        filename = f"claude-conversation-{date_str}-{session_id[:12]}.md"
         output_path = self.output_dir / filename
 
+        # Pair tool_use blocks with their matching tool_result so the
+        # Markdown renders a call followed by its result, even when other
+        # text blocks appear between them in the raw JSONL.
+        result_by_id = {
+            m.get("tool_use_id"): m
+            for m in conversation
+            if m.get("role") == "tool_result" and m.get("tool_use_id")
+        }
+        rendered_result_ids = set()
+
         with open(output_path, "w", encoding="utf-8") as f:
+            # YAML frontmatter for tooling that consumes exported files.
+            if metadata:
+                f.write("---\n")
+                f.write(f"session_id: {session_id}\n")
+                f.write(f"date: {date_str}")
+                if time_str:
+                    f.write(f" {time_str}")
+                f.write("\n")
+                if metadata.get("cwd"):
+                    f.write(f"cwd: {metadata['cwd']}\n")
+                if metadata.get("git_branch"):
+                    f.write(f"git_branch: {metadata['git_branch']}\n")
+                if metadata.get("version"):
+                    f.write(f"claude_version: {metadata['version']}\n")
+                if metadata.get("entrypoint"):
+                    f.write(f"entrypoint: {metadata['entrypoint']}\n")
+                if metadata.get("is_sidechain"):
+                    f.write("is_sidechain: true\n")
+                f.write(f"message_count: {len(conversation)}\n")
+                f.write("---\n\n")
+
             f.write("# Claude Conversation Log\n\n")
             f.write(f"Session ID: {session_id}\n")
             f.write(f"Date: {date_str}")
             if time_str:
                 f.write(f" {time_str}")
-            f.write("\n\n---\n\n")
+            f.write("\n")
+            if metadata:
+                if metadata.get("cwd"):
+                    f.write(f"Working directory: `{metadata['cwd']}`\n")
+                if metadata.get("git_branch"):
+                    f.write(f"Git branch: `{metadata['git_branch']}`\n")
+                if metadata.get("version"):
+                    f.write(f"Claude Code version: {metadata['version']}\n")
+                if metadata.get("entrypoint"):
+                    f.write(f"Entrypoint: `{metadata['entrypoint']}`\n")
+            f.write("\n---\n\n")
 
             for msg in conversation:
                 role = msg["role"]
                 content = msg["content"]
-                
+
+                # tool_results are rendered inline after their matching
+                # tool_use; skip them when iterating linearly.
+                if role == "tool_result" and msg.get("tool_use_id") in rendered_result_ids:
+                    continue
+
                 if role == "user":
                     f.write("## 👤 User\n\n")
                     f.write(f"{content}\n\n")
                 elif role == "assistant":
                     f.write("## 🤖 Claude\n\n")
                     f.write(f"{content}\n\n")
+                elif role == "thinking":
+                    f.write("<details><summary>💭 Thinking</summary>\n\n")
+                    f.write(f"{content}\n\n")
+                    f.write("</details>\n\n")
                 elif role == "tool_use":
-                    f.write("### 🔧 Tool Use\n\n")
-                    f.write(f"{content}\n\n")
+                    tool_name = msg.get("tool_name", "tool")
+                    f.write(f"### 🔧 Tool Use: `{tool_name}`\n\n")
+                    f.write("```\n")
+                    f.write(content)
+                    f.write("\n```\n\n")
+                    # Inline the paired result, if any.
+                    tid = msg.get("tool_use_id")
+                    if tid and tid in result_by_id:
+                        result = result_by_id[tid]
+                        rendered_result_ids.add(tid)
+                        marker = "❌ Tool Error" if result.get("is_error") else "📤 Tool Result"
+                        f.write(f"**{marker}**\n\n")
+                        f.write("```\n")
+                        f.write(result["content"])
+                        f.write("\n```\n\n")
                 elif role == "tool_result":
-                    f.write("### 📤 Tool Result\n\n")
-                    f.write(f"{content}\n\n")
+                    # Orphaned tool_result (no matching tool_use in session).
+                    marker = "❌ Tool Error" if msg.get("is_error") else "📤 Tool Result"
+                    f.write(f"### {marker}\n\n")
+                    f.write("```\n")
+                    f.write(content)
+                    f.write("\n```\n\n")
                 elif role == "system":
-                    f.write("### ℹ️ System\n\n")
+                    subtype = msg.get("subtype", "")
+                    label = f"ℹ️ System ({subtype})" if subtype else "ℹ️ System"
+                    f.write(f"### {label}\n\n")
                     f.write(f"{content}\n\n")
                 else:
                     f.write(f"## {role}\n\n")
@@ -344,9 +632,18 @@ class ClaudeConversationExtractor:
         return output_path
     
     def save_as_json(
-        self, conversation: List[Dict[str, str]], session_id: str
+        self,
+        conversation: List[Dict[str, str]],
+        session_id: str,
+        metadata: Optional[Dict[str, str]] = None,
     ) -> Optional[Path]:
-        """Save conversation as JSON file."""
+        """Save conversation as JSON file.
+
+        The top-level object includes a ``metadata`` block when available so
+        downstream consumers can filter or group sessions by cwd, git
+        branch, Claude Code version, or entrypoint without re-parsing the
+        original JSONL.
+        """
         if not conversation:
             return None
 
@@ -361,15 +658,15 @@ class ClaudeConversationExtractor:
         else:
             date_str = datetime.now().strftime("%Y-%m-%d")
 
-        filename = f"claude-conversation-{date_str}-{session_id[:8]}.json"
+        filename = f"claude-conversation-{date_str}-{session_id[:12]}.json"
         output_path = self.output_dir / filename
 
-        # Create JSON structure
         output = {
             "session_id": session_id,
             "date": date_str,
             "message_count": len(conversation),
-            "messages": conversation
+            "metadata": metadata or {},
+            "messages": conversation,
         }
 
         with open(output_path, "w", encoding="utf-8") as f:
@@ -378,9 +675,17 @@ class ClaudeConversationExtractor:
         return output_path
     
     def save_as_html(
-        self, conversation: List[Dict[str, str]], session_id: str
+        self,
+        conversation: List[Dict[str, str]],
+        session_id: str,
+        metadata: Optional[Dict[str, str]] = None,
     ) -> Optional[Path]:
-        """Save conversation as HTML file with syntax highlighting."""
+        """Save conversation as HTML file with syntax highlighting.
+
+        Adds a metadata panel and renders ``thinking`` blocks inside
+        collapsed ``<details>`` elements. Tool use/result pairs are
+        grouped visually.
+        """
         if not conversation:
             return None
 
@@ -398,7 +703,7 @@ class ClaudeConversationExtractor:
             date_str = datetime.now().strftime("%Y-%m-%d")
             time_str = ""
 
-        filename = f"claude-conversation-{date_str}-{session_id[:8]}.html"
+        filename = f"claude-conversation-{date_str}-{session_id[:12]}.html"
         output_path = self.output_dir / filename
 
         # HTML template with modern styling
@@ -454,9 +759,40 @@ class ClaudeConversationExtractor:
             border-left: 4px solid #e74c3c;
             background: #fff5f5;
         }}
+        .thinking {{
+            border-left: 4px solid #9b59b6;
+            background: #faf5ff;
+            font-style: italic;
+            color: #555;
+        }}
+        .thinking details summary {{
+            cursor: pointer;
+            font-weight: bold;
+            color: #9b59b6;
+        }}
         .system {{
             border-left: 4px solid #95a5a6;
             background: #f8f9fa;
+        }}
+        .metadata-panel {{
+            background: #eef2f7;
+            padding: 10px 15px;
+            border-radius: 6px;
+            margin-top: 10px;
+            font-size: 0.85em;
+            font-family: 'Courier New', monospace;
+        }}
+        .metadata-panel dt {{
+            font-weight: bold;
+            display: inline-block;
+            width: 140px;
+        }}
+        .metadata-panel dd {{
+            display: inline;
+            margin: 0;
+        }}
+        .metadata-panel dl {{
+            margin: 0;
         }}
         .role {{
             font-weight: bold;
@@ -490,54 +826,114 @@ class ClaudeConversationExtractor:
             <p>Date: {date_str} {time_str}</p>
             <p>Messages: {len(conversation)}</p>
         </div>
-    </div>
 """
+
+        def esc(s: str) -> str:
+            return (
+                s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            )
 
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(html_content)
-            
+
+            if metadata:
+                f.write('        <div class="metadata-panel"><dl>\n')
+                for key, label in (
+                    ("cwd", "Working directory"),
+                    ("git_branch", "Git branch"),
+                    ("version", "Claude Code version"),
+                    ("entrypoint", "Entrypoint"),
+                    ("user_type", "User type"),
+                ):
+                    val = metadata.get(key)
+                    if val:
+                        f.write(
+                            f'            <dt>{label}:</dt><dd>{esc(str(val))}</dd><br>\n'
+                        )
+                if metadata.get("is_sidechain"):
+                    f.write('            <dt>Sidechain:</dt><dd>true</dd><br>\n')
+                f.write("        </dl></div>\n")
+
+            f.write("    </div>\n")
+
+            # Build tool_use_id -> tool_result map for inline pairing.
+            result_by_id = {
+                m.get("tool_use_id"): m
+                for m in conversation
+                if m.get("role") == "tool_result" and m.get("tool_use_id")
+            }
+            rendered_result_ids = set()
+
             for msg in conversation:
                 role = msg["role"]
-                content = msg["content"]
-                
-                # Escape HTML
-                content = content.replace("&", "&amp;")
-                content = content.replace("<", "&lt;")
-                content = content.replace(">", "&gt;")
-                
+                content = esc(msg["content"])
+
+                if role == "tool_result" and msg.get("tool_use_id") in rendered_result_ids:
+                    continue
+
                 role_display = {
                     "user": "👤 User",
                     "assistant": "🤖 Claude",
-                    "tool_use": "🔧 Tool Use",
-                    "tool_result": "📤 Tool Result",
-                    "system": "ℹ️ System"
+                    "thinking": "💭 Thinking",
+                    "tool_use": f"🔧 Tool Use: {esc(msg.get('tool_name', ''))}",
+                    "tool_result": "❌ Tool Error" if msg.get("is_error") else "📤 Tool Result",
+                    "system": f"ℹ️ System{' (' + esc(msg.get('subtype', '')) + ')' if msg.get('subtype') else ''}",
                 }.get(role, role)
-                
+
                 f.write(f'    <div class="message {role}">\n')
                 f.write(f'        <div class="role">{role_display}</div>\n')
-                f.write(f'        <div class="content">{content}</div>\n')
-                f.write(f'    </div>\n')
-            
+                if role == "thinking":
+                    f.write(
+                        f'        <details><summary>Show reasoning</summary>'
+                        f'<div class="content">{content}</div></details>\n'
+                    )
+                else:
+                    f.write(f'        <div class="content">{content}</div>\n')
+                f.write("    </div>\n")
+
+                # Inline the paired tool_result.
+                if role == "tool_use":
+                    tid = msg.get("tool_use_id")
+                    if tid and tid in result_by_id:
+                        result = result_by_id[tid]
+                        rendered_result_ids.add(tid)
+                        result_role = "tool_result"
+                        result_label = (
+                            "❌ Tool Error" if result.get("is_error") else "📤 Tool Result"
+                        )
+                        f.write(f'    <div class="message {result_role}">\n')
+                        f.write(f'        <div class="role">{result_label}</div>\n')
+                        f.write(
+                            f'        <div class="content">{esc(result["content"])}</div>\n'
+                        )
+                        f.write("    </div>\n")
+
             f.write("\n</body>\n</html>")
 
         return output_path
 
     def save_conversation(
-        self, conversation: List[Dict[str, str]], session_id: str, format: str = "markdown"
+        self,
+        conversation: List[Dict[str, str]],
+        session_id: str,
+        format: str = "markdown",
+        metadata: Optional[Dict[str, str]] = None,
     ) -> Optional[Path]:
         """Save conversation in the specified format.
-        
+
         Args:
             conversation: The conversation data
             session_id: Session identifier
             format: Output format ('markdown', 'json', 'html')
+            metadata: Optional session envelope metadata threaded through
+                to the underlying writer.
         """
         if format == "markdown":
-            return self.save_as_markdown(conversation, session_id)
+            return self.save_as_markdown(conversation, session_id, metadata=metadata)
         elif format == "json":
-            return self.save_as_json(conversation, session_id)
+            return self.save_as_json(conversation, session_id, metadata=metadata)
         elif format == "html":
-            return self.save_as_html(conversation, session_id)
+            return self.save_as_html(conversation, session_id, metadata=metadata)
         else:
             print(f"❌ Unsupported format: {format}")
             return None
@@ -683,9 +1079,20 @@ class ClaudeConversationExtractor:
         for idx in indices:
             if 0 <= idx < len(sessions):
                 session_path = sessions[idx]
-                conversation = self.extract_conversation(session_path, detailed=detailed)
+                # Call extract_conversation so subclasses / tests that
+                # override it still see the call. Metadata is fetched
+                # separately via the lightweight envelope reader.
+                conversation = self.extract_conversation(
+                    session_path, detailed=detailed
+                )
                 if conversation:
-                    output_path = self.save_conversation(conversation, session_path.stem, format=format)
+                    metadata = self.extract_session_metadata(session_path)
+                    output_path = self.save_conversation(
+                        conversation,
+                        session_path.stem,
+                        format=format,
+                        metadata=metadata,
+                    )
                     success += 1
                     msg_count = len(conversation)
                     print(
@@ -881,19 +1288,21 @@ Examples:
                     if 1 <= view_num <= len(file_paths_list):
                         selected_path = file_paths_list[view_num - 1]
                         extractor.display_conversation(selected_path, detailed=args.detailed)
-                        
+
                         # Offer to extract after viewing
                         extract_choice = input("\n📤 Extract this conversation? (y/N): ").strip().lower()
                         if extract_choice == 'y':
-                            conversation = extractor.extract_conversation(selected_path, detailed=args.detailed)
+                            conversation, metadata = extractor.extract_session(
+                                selected_path, detailed=args.detailed
+                            )
                             if conversation:
                                 session_id = selected_path.stem
-                                if args.format == "json":
-                                    output = extractor.save_as_json(conversation, session_id)
-                                elif args.format == "html":
-                                    output = extractor.save_as_html(conversation, session_id)
-                                else:
-                                    output = extractor.save_as_markdown(conversation, session_id)
+                                output = extractor.save_conversation(
+                                    conversation,
+                                    session_id,
+                                    format=args.format,
+                                    metadata=metadata,
+                                )
                                 print(f"✅ Saved: {output.name}")
             except (EOFError, KeyboardInterrupt):
                 print("\n👋 Cancelled")
@@ -997,15 +1406,17 @@ def launch_interactive():
         if selected_file:
             # View the selected conversation
             extractor.display_conversation(selected_file)
-            
+
             # Offer to extract
             try:
                 extract_choice = input("\n📤 Extract this conversation? (y/N): ").strip().lower()
                 if extract_choice == 'y':
-                    conversation = extractor.extract_conversation(selected_file)
+                    conversation, metadata = extractor.extract_session(selected_file)
                     if conversation:
                         session_id = selected_file.stem
-                        output = extractor.save_as_markdown(conversation, session_id)
+                        output = extractor.save_as_markdown(
+                            conversation, session_id, metadata=metadata
+                        )
                         print(f"✅ Saved: {output.name}")
             except (EOFError, KeyboardInterrupt):
                 print("\n👋 Cancelled")
