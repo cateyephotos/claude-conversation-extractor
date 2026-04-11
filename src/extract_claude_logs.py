@@ -9,6 +9,7 @@ readable markdown files.
 
 import argparse
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -33,6 +34,68 @@ def _truncate_payload(payload: str, limit: int = _TOOL_PAYLOAD_MAX_CHARS) -> str
     if len(payload) <= limit:
         return payload
     return payload[:limit] + f"\n... [truncated {len(payload) - limit} chars]"
+
+
+def _is_onedrive_path(path: Path) -> bool:
+    """Return True if any component of the resolved path is an OneDrive folder.
+
+    Windows 11 with Known Folder Move enabled redirects ``%USERPROFILE%\\Desktop``
+    (and Documents, Pictures) into a synced ``OneDrive`` or
+    ``OneDrive - <Tenant>`` folder. Writing conversation history there would
+    silently upload potentially sensitive session content to OneDrive, so we
+    detect it and avoid the redirected folder as a default output target.
+    """
+    try:
+        resolved = path.expanduser().resolve()
+    except (OSError, RuntimeError):
+        # Path.resolve can raise on very long paths or unresolvable symlinks;
+        # fall back to the literal path components.
+        resolved = path.expanduser()
+    for part in resolved.parts:
+        lowered = part.lower()
+        if (
+            lowered == "onedrive"
+            or lowered.startswith("onedrive -")
+            or lowered.startswith("onedrive-")
+        ):
+            return True
+    return False
+
+
+def _default_output_candidates() -> List[Path]:
+    """Build the ordered list of default output directories for the extractor.
+
+    On Windows, prefer ``Documents/Claude logs`` because Desktop is frequently
+    redirected into OneDrive by the Known Folder Move policy, and we do not
+    want conversation history to be silently uploaded. If the resolved Desktop
+    path lives under a OneDrive folder we skip it entirely and emit a one-line
+    notice so the user understands why the fallback order changed.
+
+    Non-Windows platforms keep the historical ordering (Desktop first) because
+    macOS and Linux do not suffer from the same redirect behavior.
+    """
+    home = Path.home()
+    desktop = home / "Desktop" / "Claude logs"
+    documents = home / "Documents" / "Claude logs"
+    home_fallback = home / "Claude logs"
+    cwd_fallback = Path.cwd() / "claude-logs"
+
+    if sys.platform == "win32":
+        candidates: List[Path] = [documents]
+        if _is_onedrive_path(desktop):
+            # Announce the skip so the user knows why conversation history is
+            # not landing on their Desktop. Using print keeps parity with the
+            # existing ``📁 Saving logs to`` notice below.
+            print(
+                "ℹ️  Skipping ~/Desktop/Claude logs because Desktop is redirected "
+                "into OneDrive; defaulting to Documents instead."
+            )
+        else:
+            candidates.append(desktop)
+        candidates.extend([home_fallback, cwd_fallback])
+        return candidates
+
+    return [desktop, documents, home_fallback, cwd_fallback]
 
 
 def _decode_project_name(encoded: str) -> str:
@@ -67,13 +130,11 @@ class ClaudeConversationExtractor:
             self.output_dir = Path(output_dir)
             self.output_dir.mkdir(parents=True, exist_ok=True)
         else:
-            # Try multiple possible output directories
-            possible_dirs = [
-                Path.home() / "Desktop" / "Claude logs",
-                Path.home() / "Documents" / "Claude logs",
-                Path.home() / "Claude logs",
-                Path.cwd() / "claude-logs",
-            ]
+            # Try multiple possible output directories. The order is
+            # platform-aware: on Windows we prefer ``Documents/Claude logs``
+            # ahead of Desktop because the Desktop folder is commonly
+            # redirected into OneDrive by Known Folder Move.
+            possible_dirs = _default_output_candidates()
 
             # Use the first directory we can create
             for dir_path in possible_dirs:
