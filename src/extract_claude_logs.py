@@ -149,9 +149,17 @@ class ClaudeConversationExtractor:
                 except Exception:
                     continue
             else:
-                # Fallback to current directory
+                # Fallback to current directory. We still set ``output_dir``
+                # even when ``mkdir`` fails so the constructor always
+                # succeeds — downstream ``save_*`` methods will surface the
+                # real error when they try to write. This makes the
+                # extractor robust in sandboxes, read-only homedirs, and
+                # tests that deliberately patch ``mkdir`` to raise.
                 self.output_dir = Path.cwd() / "claude-logs"
-                self.output_dir.mkdir(exist_ok=True)
+                try:
+                    self.output_dir.mkdir(exist_ok=True)
+                except Exception:
+                    pass
 
         print(f"📁 Saving logs to: {self.output_dir}")
 
