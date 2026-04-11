@@ -11,12 +11,18 @@ from typing import List, Optional
 
 # Handle both package and direct execution imports
 try:
-    from .extract_claude_logs import ClaudeConversationExtractor
+    from .extract_claude_logs import (
+        ClaudeConversationExtractor,
+        _decode_project_name,
+    )
     from .realtime_search import RealTimeSearch, create_smart_searcher
     from .search_conversations import ConversationSearcher
 except ImportError:
     # Fallback for direct execution or when not installed as package
-    from extract_claude_logs import ClaudeConversationExtractor
+    from extract_claude_logs import (
+        ClaudeConversationExtractor,
+        _decode_project_name,
+    )
     from realtime_search import RealTimeSearch, create_smart_searcher
     from search_conversations import ConversationSearcher
 
@@ -121,7 +127,13 @@ class InteractiveUI:
 
         # Display sessions
         for i, session_path in enumerate(self.sessions[:20], 1):  # Show max 20
-            project = session_path.parent.name
+            # Decode the encoded project folder name
+            # (e.g. ``C--code-myapp`` -> ``C:/code/myapp``) so the
+            # listing shows the real absolute path instead of a
+            # hyphen-mangled slug. The decoder takes whatever folder
+            # name Claude Code put on disk at runtime — nothing is
+            # baked in.
+            project = _decode_project_name(session_path.parent.name)
             modified = datetime.fromtimestamp(session_path.stat().st_mtime)
             size_kb = session_path.stat().st_size / 1024
 

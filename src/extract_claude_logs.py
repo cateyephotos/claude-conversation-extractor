@@ -38,12 +38,21 @@ def _truncate_payload(payload: str, limit: int = _TOOL_PAYLOAD_MAX_CHARS) -> str
 def _decode_project_name(encoded: str) -> str:
     """Decode Claude Code's CWD-as-folder encoding.
 
-    Claude Code stores conversations under ~/.claude/projects/<encoded-cwd>/
-    where slashes and colons are replaced with hyphens. E.g.:
-        C--Users-thomasc8-Downloads -> C:/Users/thomasc8/Downloads
-        Z--git -> Z:/git
-    Returns the original path as a display string; falls back to the raw
-    encoded name if decoding produces something implausible.
+    Claude Code stores conversations under ``~/.claude/projects/<encoded-cwd>/``
+    where slashes and colons in the original working directory are
+    replaced with hyphens. E.g.::
+
+        C--code-myapp           -> C:/code/myapp   (Windows drive path)
+        Z--git                  -> Z:/git          (Windows drive root)
+        -opt-code-myapp         -> /opt/code/myapp (POSIX absolute path)
+
+    The decoder is purely string-level: it takes whatever folder name
+    Claude Code put on disk at runtime and returns a human-readable
+    absolute path. Nothing is baked in — the examples above use
+    generic names so the contract is clear, but the function works
+    for any drive letter, any username, and any directory structure.
+    Falls back to the raw encoded name if decoding produces something
+    implausible.
     """
     if not encoded:
         return encoded
@@ -1035,10 +1044,12 @@ class ClaudeConversationExtractor:
         # Show all sessions if no limit specified
         sessions_to_show = sessions[:limit] if limit else sessions
         for i, session in enumerate(sessions_to_show, 1):
-            # Clean up project name (remove hyphens, make readable)
-            project = session.parent.name.replace('-', ' ').strip()
-            if project.startswith("Users"):
-                project = "~/" + "/".join(project.split()[2:]) if len(project.split()) > 2 else "Home"
+            # Decode the encoded project folder name (e.g.
+            # ``C--code-myapp`` -> ``C:/code/myapp``) into its real
+            # absolute path so the listing is readable. The decoder
+            # takes whatever folder name Claude Code put on disk at
+            # runtime — nothing is baked in.
+            project = _decode_project_name(session.parent.name)
             
             session_id = session.stem
             modified = datetime.fromtimestamp(session.stat().st_mtime)
