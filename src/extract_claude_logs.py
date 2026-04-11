@@ -128,6 +128,30 @@ def _decode_project_name(encoded: str) -> str:
     return encoded.replace("-", "/")
 
 
+def _parse_date_filter(value: str, field_name: str) -> float:
+    """Parse a CLI date filter value into a POSIX timestamp.
+
+    Accepts two ISO-8601 shapes:
+    - ``YYYY-MM-DD`` — midnight local time on that day.
+    - ``YYYY-MM-DDTHH:MM:SS`` — explicit local time.
+
+    Raises:
+        ValueError: if ``value`` does not match either shape. The
+            message names ``field_name`` so callers (CLI, tests) can
+            tell which argument was malformed.
+    """
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(value, fmt)
+            return parsed.timestamp()
+        except ValueError:
+            continue
+    raise ValueError(
+        f"Invalid --{field_name} date {value!r}: expected YYYY-MM-DD or "
+        f"YYYY-MM-DDTHH:MM:SS"
+    )
+
+
 class ClaudeConversationExtractor:
     """Extract and convert Claude Code conversations from JSONL to markdown."""
 
@@ -172,16 +196,44 @@ class ClaudeConversationExtractor:
 
         print(f"📁 Saving logs to: {self.output_dir}")
 
-    def find_sessions(self, project_path: Optional[str] = None) -> List[Path]:
-        """Find all JSONL session files, sorted by most recent first."""
+    def find_sessions(
+        self,
+        project_path: Optional[str] = None,
+        after: Optional[str] = None,
+        before: Optional[str] = None,
+    ) -> List[Path]:
+        """Find all JSONL session files, sorted by most recent first.
+
+        Args:
+            project_path: Optional project slug to scope the search to
+                ``~/.claude/projects/<project_path>``.
+            after: Only include sessions modified at or after this time.
+                Accepts ``YYYY-MM-DD`` or ``YYYY-MM-DDTHH:MM:SS`` (ISO).
+            before: Only include sessions modified strictly before this
+                time. Same format as ``after``.
+
+        Raises:
+            ValueError: if ``after`` or ``before`` cannot be parsed.
+        """
         if project_path:
             search_dir = self.claude_dir / project_path
         else:
             search_dir = self.claude_dir
 
+        after_ts = _parse_date_filter(after, "after") if after else None
+        before_ts = _parse_date_filter(before, "before") if before else None
+
         sessions = []
         if search_dir.exists():
             for jsonl_file in search_dir.rglob("*.jsonl"):
+                try:
+                    mtime = jsonl_file.stat().st_mtime
+                except OSError:
+                    continue
+                if after_ts is not None and mtime < after_ts:
+                    continue
+                if before_ts is not None and mtime >= before_ts:
+                    continue
                 sessions.append(jsonl_file)
         return sorted(sessions, key=lambda x: x.stat().st_mtime, reverse=True)
 
@@ -1098,9 +1150,20 @@ class ClaudeConversationExtractor:
         except Exception as e:
             return f"Error: {str(e)[:30]}", 0
 
-    def list_recent_sessions(self, limit: int = None) -> List[Path]:
-        """List recent sessions with details."""
-        sessions = self.find_sessions()
+    def list_recent_sessions(
+        self,
+        limit: int = None,
+        after: Optional[str] = None,
+        before: Optional[str] = None,
+    ) -> List[Path]:
+        """List recent sessions with details.
+
+        Args:
+            limit: Optional upper bound on how many sessions to display.
+            after: Optional ``YYYY-MM-DD`` lower bound on session mtime.
+            before: Optional ``YYYY-MM-DD`` upper bound on session mtime.
+        """
+        sessions = self.find_sessions(after=after, before=before)
 
         if not sessions:
             print("❌ No Claude sessions found in ~/.claude/projects/")
@@ -1223,6 +1286,24 @@ Examples:
     )
     parser.add_argument(
         "--limit", type=int, help="Limit for --list command (default: show all)", default=None
+    )
+    parser.add_argument(
+        "--after",
+        type=str,
+        default=None,
+        help=(
+            "Only include sessions modified at or after this time "
+            "(YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)"
+        ),
+    )
+    parser.add_argument(
+        "--before",
+        type=str,
+        default=None,
+        help=(
+            "Only include sessions modified strictly before this time "
+            "(YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)"
+        ),
     )
     parser.add_argument(
         "--interactive",
@@ -1397,7 +1478,9 @@ Examples:
         and not args.search
         and not args.search_regex
     ):
-        sessions = extractor.list_recent_sessions(args.limit)
+        sessions = extractor.list_recent_sessions(
+            args.limit, after=args.after, before=args.before
+        )
 
         if sessions and not args.list:
             print("\nTo extract conversations:")
@@ -1406,7 +1489,7 @@ Examples:
             print("  claude-extract --all                   # Extract all sessions")
 
     elif args.extract:
-        sessions = extractor.find_sessions()
+        sessions = extractor.find_sessions(after=args.after, before=args.before)
 
         # Parse comma-separated indices
         indices = []
@@ -1428,7 +1511,7 @@ Examples:
             print(f"\n✅ Successfully extracted {success}/{total} sessions")
 
     elif args.recent:
-        sessions = extractor.find_sessions()
+        sessions = extractor.find_sessions(after=args.after, before=args.before)
         limit = min(args.recent, len(sessions))
         print(f"\n📤 Extracting {limit} most recent sessions as {args.format.upper()}...")
         if args.detailed:
@@ -1441,7 +1524,7 @@ Examples:
         print(f"\n✅ Successfully extracted {success}/{total} sessions")
 
     elif args.all:
-        sessions = extractor.find_sessions()
+        sessions = extractor.find_sessions(after=args.after, before=args.before)
         print(f"\n📤 Extracting all {len(sessions)} sessions as {args.format.upper()}...")
         if args.detailed:
             print("📋 Including detailed tool use and system messages")
