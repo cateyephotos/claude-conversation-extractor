@@ -1107,6 +1107,112 @@ class ClaudeConversationExtractor:
         return success, total
 
 
+# ---------------------------------------------------------------------------
+# Post-session auto-archive hook installer (CCE-16)
+# ---------------------------------------------------------------------------
+
+# Exact command we want to land in the user's ``settings.json`` Stop hook.
+# Using ``--recent 1 --detailed`` matches the recipe documented in the
+# README: archive the most recent session with full tool trace after
+# every Claude Code session exit.
+_HOOK_COMMAND = "claude-extract --recent 1 --detailed"
+
+
+def _hook_already_installed(settings: dict) -> bool:
+    """True if a Stop hook entry invoking claude-extract already exists."""
+    stop_hooks = (
+        settings.get("hooks", {}).get("Stop", [])
+        if isinstance(settings.get("hooks", {}), dict)
+        else []
+    )
+    for group in stop_hooks or []:
+        inner = group.get("hooks", []) if isinstance(group, dict) else []
+        for entry in inner:
+            if not isinstance(entry, dict):
+                continue
+            cmd = entry.get("command", "")
+            if entry.get("type") == "command" and "claude-extract" in cmd:
+                return True
+    return False
+
+
+def install_hook(settings_path: Optional[Path] = None) -> bool:
+    """Install a Claude Code Stop hook that auto-archives every session.
+
+    Writes (or merges into) ``settings_path`` the hook block::
+
+        {"hooks": {"Stop": [{"hooks": [{"type": "command",
+                                        "command": "claude-extract --recent 1 --detailed"}]}]}}
+
+    Behavior:
+    - If the hook is already present, returns False without prompting.
+    - Otherwise prompts the user with a y/N confirmation. Declining is a
+      no-op and returns False.
+    - On accept, merges the hook into the existing file (preserving
+      unrelated keys and hook events) and returns True.
+
+    Args:
+        settings_path: Override for ``~/.claude/settings.json``. Used by
+            tests; production callers should leave this at the default.
+    """
+    if settings_path is None:
+        settings_path = Path.home() / ".claude" / "settings.json"
+
+    existing: dict = {}
+    if settings_path.exists():
+        try:
+            existing = json.loads(settings_path.read_text(encoding="utf-8"))
+            if not isinstance(existing, dict):
+                existing = {}
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+
+    if _hook_already_installed(existing):
+        print(
+            f"ℹ️  Stop hook already installed in {settings_path}. "
+            f"Nothing to do."
+        )
+        return False
+
+    print(
+        f"About to install this Stop hook into {settings_path}:\n\n"
+        f"  {_HOOK_COMMAND}\n\n"
+        f"This runs after every Claude Code session exit and archives "
+        f"the latest session to your configured output folder."
+    )
+    try:
+        answer = input("Proceed? [y/N]: ").strip().lower()
+    except EOFError:
+        answer = ""
+    if answer not in ("y", "yes"):
+        print("Aborted. settings.json was not modified.")
+        return False
+
+    hooks_block = existing.setdefault("hooks", {})
+    if not isinstance(hooks_block, dict):
+        hooks_block = {}
+        existing["hooks"] = hooks_block
+    stop_block = hooks_block.setdefault("Stop", [])
+    if not isinstance(stop_block, list):
+        stop_block = []
+        hooks_block["Stop"] = stop_block
+    stop_block.append(
+        {
+            "hooks": [
+                {"type": "command", "command": _HOOK_COMMAND},
+            ]
+        }
+    )
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(
+        json.dumps(existing, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"✅ Installed Stop hook into {settings_path}.")
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Extract Claude Code conversations to clean markdown files",
@@ -1143,6 +1249,15 @@ Examples:
     )
     parser.add_argument(
         "--limit", type=int, help="Limit for --list command (default: show all)", default=None
+    )
+    parser.add_argument(
+        "--install-hook",
+        action="store_true",
+        help=(
+            "Install a Claude Code Stop hook into ~/.claude/settings.json "
+            "that runs 'claude-extract --recent 1 --detailed' after every "
+            "session exit, archiving each session outside ~/.claude/projects/"
+        ),
     )
     parser.add_argument(
         "--interactive",
@@ -1195,6 +1310,13 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    # Handle --install-hook before anything else so the command stays
+    # usable even if the user has no sessions yet. Short-circuits the
+    # rest of main() on completion.
+    if args.install_hook:
+        install_hook()
+        return
 
     # Handle interactive mode
     if args.interactive or (args.export and args.export.lower() == "logs"):
