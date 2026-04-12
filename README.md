@@ -204,6 +204,46 @@ claude-extract
 - Shows match previews and conversation context
 - Option to extract matching sessions directly
 
+## 🪝 Auto-archive Every Session (Claude Code Stop Hook)
+
+Claude Code may prune old entries from `~/.claude/projects/` over time.
+To keep a permanent archive of every conversation, install a `Stop`
+hook that runs `claude-extract --recent 1 --detailed` every time you
+exit a Claude Code session:
+
+```bash
+claude-extract --install-hook
+```
+
+This prompts for confirmation and then merges the following block into
+`~/.claude/settings.json` (preserving anything else that is already
+there):
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "claude-extract --recent 1 --detailed"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+After that, every `/exit` from Claude Code will quietly archive the
+conversation you just had to your configured output folder (default:
+`~/Desktop/Claude logs` on non-Windows, `~/Documents/Claude logs` on
+Windows — see [CCE-5](docs/development/LINEAR_PROJECT.md) for why).
+
+Re-running `--install-hook` is idempotent; it detects an existing
+`claude-extract` Stop hook and does nothing.
+
 ## 📁 Where Are Claude Code Logs Stored?
 
 ### Claude Code Default Locations:
